@@ -14,6 +14,19 @@
 #include <cmath>
 #include <csignal>
 #include <atomic>
+#include <algorithm>
+#include <vector>
+#ifdef RTX5090_OPT
+#include <cerrno>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "CUDAMath.h"
 #include "sha256.h"
@@ -49,7 +62,28 @@ __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Jx[4];
 __constant__ uint64_t c_Jy[4];
 
+#ifdef RTX5090_OPT
+static_assert(RTX5090_BATCH == 64 || RTX5090_BATCH == 128 || RTX5090_BATCH == 256 ||
+              RTX5090_BATCH == 512 || RTX5090_BATCH == 1024,
+              "RTX5090_BATCH must be one of 64, 128, 256, 512, 1024");
+static_assert(RTX5090_TPB >= 32 && RTX5090_TPB <= 1024 && (RTX5090_TPB % 32) == 0,
+              "RTX5090_TPB must be a valid whole-warp block size");
+
+static __device__ __forceinline__ bool hash160_words_match_5090(
+    const uint32_t h[5], const uint32_t target_prefix)
+{
+    if (h[0] != target_prefix) return false;
+    return h[1] == c_target_hash160_words[1]
+        && h[2] == c_target_hash160_words[2]
+        && h[3] == c_target_hash160_words[3]
+        && h[4] == c_target_hash160_words[4];
+}
+
+template<int B>
+__launch_bounds__(RTX5090_TPB, RTX5090_MIN_BLOCKS)
+#else
 __launch_bounds__(256, 2)
+#endif
 __global__ void kernel_point_add_and_check_oneinv(
     const uint64_t* __restrict__ Px,
     const uint64_t* __restrict__ Py,
@@ -58,7 +92,9 @@ __global__ void kernel_point_add_and_check_oneinv(
     uint64_t* __restrict__ start_scalars,
     uint64_t* __restrict__ counts256,
     uint64_t threadsTotal,
+#ifndef RTX5090_OPT
     uint32_t batch_size,
+#endif
     uint32_t max_batches_per_launch,
     int* __restrict__ d_found_flag,
     FoundResult* __restrict__ d_found_result,
@@ -66,9 +102,13 @@ __global__ void kernel_point_add_and_check_oneinv(
     unsigned int* __restrict__ d_any_left
 )
 {
+#ifdef RTX5090_OPT
+    constexpr int half = B / 2;
+#else
     const int B = (int)batch_size;
     if (B <= 0 || (B & 1) || B > MAX_BATCH_SIZE) return;
     const int half = B >> 1;
+#endif
 
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;
@@ -112,14 +152,30 @@ __global__ void kernel_point_add_and_check_oneinv(
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
         {
+#ifdef RTX5090_OPT
+            uint32_t h160[5];
+            const uint8_t prefix = (y1[0] & 1ULL) ? 0x03 : 0x02;
+            getHash160_33_from_limbs_5090(prefix, x1, h160);
+#else
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
             getHash160_33_from_limbs(prefix, x1, h20);
+#endif
             ++local_hashes; MAYBE_WARP_FLUSH();
 
+#ifdef RTX5090_OPT
+            bool pref = h160[0] == target_prefix;
+#else
             bool pref = hash160_prefix_equals(h20, target_prefix);
+#endif
+#ifdef RTX5090_OPT
+            const bool full_match = pref && hash160_words_match_5090(h160, target_prefix);
+            if (__any_sync(full_mask, full_match)) {
+                if (full_match) {
+#else
             if (__any_sync(full_mask, pref)) {
                 if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+#endif
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                         d_found_result->threadId = (int)gid;
                         d_found_result->iter     = 0;
@@ -192,12 +248,26 @@ __global__ void kernel_point_add_and_check_oneinv(
                 _ModMult(s, s, lam);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
+#ifdef RTX5090_OPT
+                uint32_t h160[5]; getHash160_33_from_limbs_5090(odd?0x03:0x02, px3, h160);
+#else
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+#endif
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
+#ifdef RTX5090_OPT
+                bool pref = h160[0] == target_prefix;
+#else
                 bool pref = hash160_prefix_equals(h20, target_prefix);
+#endif
+#ifdef RTX5090_OPT
+                const bool full_match = pref && hash160_words_match_5090(h160, target_prefix);
+                if (__any_sync(full_mask, full_match)) {
+                    if (full_match) {
+#else
                 if (__any_sync(full_mask, pref)) {
                     if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+#endif
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                             uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
                             uint64_t addv=(uint64_t)(i+1);
@@ -238,12 +308,26 @@ __global__ void kernel_point_add_and_check_oneinv(
                 _ModMult(s, s, lam);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
+#ifdef RTX5090_OPT
+                uint32_t h160[5]; getHash160_33_from_limbs_5090(odd?0x03:0x02, px3, h160);
+#else
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+#endif
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
+#ifdef RTX5090_OPT
+                bool pref = h160[0] == target_prefix;
+#else
                 bool pref = hash160_prefix_equals(h20, target_prefix);
+#endif
+#ifdef RTX5090_OPT
+                const bool full_match = pref && hash160_words_match_5090(h160, target_prefix);
+                if (__any_sync(full_mask, full_match)) {
+                    if (full_match) {
+#else
                 if (__any_sync(full_mask, pref)) {
                     if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+#endif
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                             uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
                             uint64_t sub=(uint64_t)(i+1);
@@ -294,12 +378,26 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(s, s, lam);
             uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
+#ifdef RTX5090_OPT
+            uint32_t h160[5]; getHash160_33_from_limbs_5090(odd?0x03:0x02, px3, h160);
+#else
             uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+#endif
             ++local_hashes; MAYBE_WARP_FLUSH();
 
+#ifdef RTX5090_OPT
+            bool pref = h160[0] == target_prefix;
+#else
             bool pref = hash160_prefix_equals(h20, target_prefix);
+#endif
+#ifdef RTX5090_OPT
+            const bool full_match = pref && hash160_words_match_5090(h160, target_prefix);
+            if (__any_sync(full_mask, full_match)) {
+                if (full_match) {
+#else
             if (__any_sync(full_mask, pref)) {
                 if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+#endif
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                         uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
                         uint64_t sub=(uint64_t)half;
@@ -382,13 +480,400 @@ extern bool decode_p2pkh_address(const std::string& addr, uint8_t out20[20]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
+#ifdef RTX5090_OPT
+struct HashSelfTestSummary {
+    unsigned int pubkey_mismatches;
+    unsigned int sha256_mismatches;
+    unsigned int ripemd160_mismatches;
+    unsigned int match_mismatches;
+    unsigned int prefix02_count;
+    unsigned int prefix03_count;
+    uint32_t first_hash160[5];
+};
+
+__global__ void hash_self_test_kernel_5090(
+    const uint64_t* __restrict__ x,
+    const uint64_t* __restrict__ y,
+    int count,
+    HashSelfTestSummary* summary)
+{
+    const int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (gid >= count) return;
+    uint64_t lx[4], ly[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        lx[i] = x[(size_t)gid * 4 + i];
+        ly[i] = y[(size_t)gid * 4 + i];
+    }
+    const uint8_t prefix = (ly[0] & 1ull) ? 0x03 : 0x02;
+    if (prefix == 0x02) atomicAdd(&summary->prefix02_count, 1u);
+    else atomicAdd(&summary->prefix03_count, 1u);
+
+    uint8_t pubkey[33];
+    pubkey[0] = prefix;
+#pragma unroll
+    for (int limb = 0; limb < 4; ++limb) {
+        const uint64_t value = lx[3 - limb];
+        const int offset = 1 + limb * 8;
+#pragma unroll
+        for (int byte = 0; byte < 8; ++byte) {
+            pubkey[offset + byte] = (uint8_t)(value >> (56 - byte * 8));
+        }
+    }
+    uint8_t pubkey_opt[33];
+    pubkey_opt[0] = prefix;
+#pragma unroll
+    for (int limb = 0; limb < 4; ++limb) storeU64BE(pubkey_opt + 1 + limb * 8, lx[3 - limb]);
+    bool pubkey_bad = false;
+#pragma unroll
+    for (int i = 0; i < 33; ++i) pubkey_bad |= pubkey[i] != pubkey_opt[i];
+    if (pubkey_bad) atomicAdd(&summary->pubkey_mismatches, 1u);
+
+    uint8_t sha_ref[32], ripemd_ref[20];
+    getSHA256_33bytes(pubkey, sha_ref);
+    getRIPEMD160_32bytes(sha_ref, ripemd_ref);
+
+    uint32_t sha_opt[8], ripemd_opt[5];
+    getSHA256_33_from_limbs_5090(prefix, lx, sha_opt);
+    getHash160_33_from_limbs_5090(prefix, lx, ripemd_opt);
+
+    bool sha_bad = false;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sha_bad |= sha_ref[4*i + 0] != (uint8_t)(sha_opt[i] >> 24);
+        sha_bad |= sha_ref[4*i + 1] != (uint8_t)(sha_opt[i] >> 16);
+        sha_bad |= sha_ref[4*i + 2] != (uint8_t)(sha_opt[i] >> 8);
+        sha_bad |= sha_ref[4*i + 3] != (uint8_t)sha_opt[i];
+    }
+    bool ripemd_bad = false;
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        const uint32_t ref = (uint32_t)ripemd_ref[4*i + 0]
+                           | ((uint32_t)ripemd_ref[4*i + 1] << 8)
+                           | ((uint32_t)ripemd_ref[4*i + 2] << 16)
+                           | ((uint32_t)ripemd_ref[4*i + 3] << 24);
+        ripemd_bad |= ref != ripemd_opt[i];
+    }
+    if (sha_bad) atomicAdd(&summary->sha256_mismatches, 1u);
+    if (ripemd_bad) atomicAdd(&summary->ripemd160_mismatches, 1u);
+
+    const bool ref_match = load_u32_le(ripemd_ref) == 0xe8761e75u
+                        && ripemd_ref[4] == 0x19u;
+    const bool opt_match = ripemd_opt[0] == 0xe8761e75u
+                        && (ripemd_opt[1] & 0xffu) == 0x19u;
+    if (ref_match != opt_match) atomicAdd(&summary->match_mismatches, 1u);
+    if (gid == 0) {
+#pragma unroll
+        for (int i = 0; i < 5; ++i) summary->first_hash160[i] = ripemd_opt[i];
+    }
+}
+
+static int run_hash_self_test_5090(int count) {
+    if (count < 2) count = 2;
+    std::vector<uint64_t> scalars((size_t)count * 4, 0ull);
+    scalars[0] = 1ull;
+    uint64_t rng = 0x71c0ffee5090128ull;
+    auto next_u64 = [&]() {
+        rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
+        return rng * 0x2545F4914F6CDD1Dull;
+    };
+    for (int i = 1; i < count; ++i) {
+        scalars[(size_t)i*4 + 0] = next_u64();
+        scalars[(size_t)i*4 + 1] = next_u64() & 0x7full;
+    }
+
+    uint64_t *d_scalars = nullptr, *d_x = nullptr, *d_y = nullptr;
+    HashSelfTestSummary *d_summary = nullptr, summary{};
+    auto check = [](cudaError_t error, const char* where) {
+        if (error != cudaSuccess) {
+            std::cerr << "Self-test CUDA error at " << where << ": " << cudaGetErrorString(error) << "\n";
+            std::exit(EXIT_FAILURE);
+        }
+    };
+    const size_t bytes = scalars.size() * sizeof(uint64_t);
+    check(cudaMalloc(&d_scalars, bytes), "cudaMalloc scalars");
+    check(cudaMalloc(&d_x, bytes), "cudaMalloc x");
+    check(cudaMalloc(&d_y, bytes), "cudaMalloc y");
+    check(cudaMalloc(&d_summary, sizeof(summary)), "cudaMalloc summary");
+    check(cudaMemcpy(d_scalars, scalars.data(), bytes, cudaMemcpyHostToDevice), "copy scalars");
+    check(cudaMemset(d_summary, 0, sizeof(summary)), "clear summary");
+    const int threads = 256;
+    scalarMulKernelBase<<<(count + threads - 1) / threads, threads>>>(d_scalars, d_x, d_y, count);
+    check(cudaDeviceSynchronize(), "scalar multiplication");
+    hash_self_test_kernel_5090<<<(count + threads - 1) / threads, threads>>>(d_x, d_y, count, d_summary);
+    check(cudaDeviceSynchronize(), "hash comparison");
+    check(cudaMemcpy(&summary, d_summary, sizeof(summary), cudaMemcpyDeviceToHost), "copy summary");
+    uint64_t first_x[4], first_y[4];
+    check(cudaMemcpy(first_x, d_x, sizeof(first_x), cudaMemcpyDeviceToHost), "copy first x");
+    check(cudaMemcpy(first_y, d_y, sizeof(first_y), cudaMemcpyDeviceToHost), "copy first y");
+    cudaFree(d_scalars); cudaFree(d_x); cudaFree(d_y); cudaFree(d_summary);
+
+    const uint32_t expected_hash[5] = {0xe8761e75u, 0xd4969119u, 0x451c9454u, 0x23a3b3d1u, 0xd63b43f1u};
+    bool known_hash_ok = true;
+    for (int i = 0; i < 5; ++i) known_hash_ok &= summary.first_hash160[i] == expected_hash[i];
+    const std::string expected_pub = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";
+    const bool known_pub_ok = formatCompressedPubHex(first_x, first_y) == expected_pub;
+    const bool ok = known_pub_ok && known_hash_ok
+                 && summary.pubkey_mismatches == 0
+                 && summary.sha256_mismatches == 0
+                 && summary.ripemd160_mismatches == 0
+                 && summary.match_mismatches == 0
+                 && summary.prefix02_count != 0
+                 && summary.prefix03_count != 0;
+    std::cout << "HASH160 self-test: " << (ok ? "PASS" : "FAIL") << "\n"
+              << "Private keys       : " << count << "\n"
+              << "Prefix 02 / 03     : " << summary.prefix02_count << " / " << summary.prefix03_count << "\n"
+              << "Pubkey differences : " << summary.pubkey_mismatches << "\n"
+              << "SHA256 differences : " << summary.sha256_mismatches << "\n"
+              << "RIPEMD differences : " << summary.ripemd160_mismatches << "\n"
+              << "Match differences  : " << summary.match_mismatches << "\n"
+              << "Known pubkey/hash  : " << (known_pub_ok ? "PASS" : "FAIL")
+              << " / " << (known_hash_ok ? "PASS" : "FAIL") << "\n";
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+struct RandomBlockOptions5090 {
+    bool enabled = false;
+    bool child = false;
+    bool seed_given = false;
+    uint64_t seed = 0;
+    unsigned int block_bits = 37;
+    std::string checkpoint = "cudacyclone-p71.checkpoint";
+};
+
+static bool write_checkpoint_atomic_5090(
+    const std::string& path,
+    const std::string& range_start,
+    const std::string& range_end,
+    unsigned int block_bits,
+    uint64_t seed,
+    uint64_t next_counter)
+{
+    std::ostringstream contents;
+    contents << "version=1\n"
+             << "range_start=" << range_start << "\n"
+             << "range_end=" << range_end << "\n"
+             << "block_bits=" << block_bits << "\n"
+             << "seed=" << seed << "\n"
+             << "next_counter=" << next_counter << "\n";
+    const std::string data = contents.str();
+    const std::string temporary = path + ".tmp." + std::to_string((unsigned long long)getpid());
+    const int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    size_t written = 0;
+    while (written < data.size()) {
+        const ssize_t amount = write(fd, data.data() + written, data.size() - written);
+        if (amount <= 0) { close(fd); unlink(temporary.c_str()); return false; }
+        written += (size_t)amount;
+    }
+    if (fsync(fd) != 0 || close(fd) != 0) { unlink(temporary.c_str()); return false; }
+    if (rename(temporary.c_str(), path.c_str()) != 0) { unlink(temporary.c_str()); return false; }
+    std::filesystem::path checkpoint_path(path);
+    std::filesystem::path parent = checkpoint_path.parent_path();
+    if (parent.empty()) parent = ".";
+    const int directory_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if (directory_fd >= 0) { (void)fsync(directory_fd); close(directory_fd); }
+    return true;
+}
+
+static bool read_checkpoint_5090(const std::string& path, std::map<std::string,std::string>& values) {
+    std::ifstream input(path);
+    if (!input) return false;
+    std::string line;
+    while (std::getline(input, line)) {
+        const size_t equals = line.find('=');
+        if (equals != std::string::npos) values[line.substr(0, equals)] = line.substr(equals + 1);
+    }
+    return values["version"] == "1";
+}
+
+static void shifted_u64_256_5090(uint64_t value, unsigned int shift, uint64_t out[4]) {
+    out[0] = out[1] = out[2] = out[3] = 0ull;
+    const unsigned int word = shift >> 6;
+    const unsigned int bits = shift & 63u;
+    if (word < 4) out[word] = value << bits;
+    if (bits && word + 1 < 4) out[word + 1] = value >> (64u - bits);
+}
+
+static int run_random_blocks_5090(
+    const char* executable,
+    const std::string& canonical_start,
+    const std::string& canonical_end,
+    const uint64_t range_start[4],
+    const uint64_t range_len[4],
+    const std::string& target_hash_hex,
+    const std::string& address_b58,
+    uint32_t batch,
+    uint32_t batches_per_sm,
+    uint32_t slices,
+    RandomBlockOptions5090 options)
+{
+    int range_bits = -1;
+    for (int limb = 0; limb < 4; ++limb) {
+        if (!range_len[limb]) continue;
+        if ((range_len[limb] & (range_len[limb] - 1ull)) != 0ull || range_bits != -1) {
+            std::cerr << "Error: random-block range length must be a power of two.\n";
+            return EXIT_FAILURE;
+        }
+        range_bits = limb * 64 + __builtin_ctzll(range_len[limb]);
+    }
+    if (range_bits < 0 || options.block_bits > (unsigned int)range_bits || options.block_bits < 20) {
+        std::cerr << "Error: --block-bits must be in 20..range_bits (" << range_bits << ").\n";
+        return EXIT_FAILURE;
+    }
+    const unsigned int index_bits = (unsigned int)range_bits - options.block_bits;
+    if (index_bits >= 64) {
+        std::cerr << "Error: random-block index does not fit in uint64.\n";
+        return EXIT_FAILURE;
+    }
+    const uint64_t total_blocks = index_bits == 0 ? 1ull : (1ull << index_bits);
+    const uint64_t index_mask = total_blocks - 1ull;
+    uint64_t next_counter = 0ull;
+
+    std::map<std::string,std::string> saved;
+    if (read_checkpoint_5090(options.checkpoint, saved)) {
+        try {
+            if (saved["range_start"] != canonical_start || saved["range_end"] != canonical_end
+                || std::stoul(saved["block_bits"]) != options.block_bits) {
+                std::cerr << "Error: checkpoint range or block size does not match this invocation.\n";
+                return EXIT_FAILURE;
+            }
+            const uint64_t saved_seed = std::stoull(saved["seed"]);
+            if (options.seed_given && options.seed != saved_seed) {
+                std::cerr << "Error: --seed does not match checkpoint seed.\n";
+                return EXIT_FAILURE;
+            }
+            options.seed = saved_seed;
+            next_counter = std::stoull(saved["next_counter"]);
+        } catch (...) {
+            std::cerr << "Error: invalid checkpoint contents.\n";
+            return EXIT_FAILURE;
+        }
+    } else {
+        if (std::filesystem::exists(options.checkpoint)) {
+            std::cerr << "Error: checkpoint exists but is invalid.\n";
+            return EXIT_FAILURE;
+        }
+        if (!options.seed_given) {
+            options.seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count()
+                         ^ ((uint64_t)getpid() << 32);
+        }
+        if (!write_checkpoint_atomic_5090(options.checkpoint, canonical_start, canonical_end,
+                                          options.block_bits, options.seed, next_counter)) {
+            std::cerr << "Error: cannot create checkpoint " << options.checkpoint << ": " << std::strerror(errno) << "\n";
+            return EXIT_FAILURE;
+        }
+    }
+    if (next_counter > total_blocks) {
+        std::cerr << "Error: checkpoint counter exceeds total block count.\n";
+        return EXIT_FAILURE;
+    }
+
+    uint64_t mix = options.seed;
+    mix ^= mix >> 30; mix *= 0xbf58476d1ce4e5b9ull;
+    mix ^= mix >> 27; mix *= 0x94d049bb133111ebull;
+    mix ^= mix >> 31;
+    const uint64_t multiplier = mix | 1ull;
+    mix += 0x9e3779b97f4a7c15ull;
+    mix ^= mix >> 30; mix *= 0xbf58476d1ce4e5b9ull;
+    mix ^= mix >> 27; mix *= 0x94d049bb133111ebull;
+    mix ^= mix >> 31;
+    const uint64_t addend = mix;
+
+    std::cout << "Random blocks mode  : enabled\n"
+              << "Seed                : " << options.seed << "\n"
+              << "Block bits          : " << options.block_bits << "\n"
+              << "Total blocks        : " << total_blocks << "\n"
+              << "Resume counter      : " << next_counter << "\n"
+              << "Checkpoint          : " << options.checkpoint << "\n";
+
+    for (uint64_t counter = next_counter; counter < total_blocks; ++counter) {
+        const uint64_t block_index = (multiplier * counter + addend) & index_mask;
+        uint64_t offset[4], block_start[4], block_end[4], block_mask[4];
+        shifted_u64_256_5090(block_index, options.block_bits, offset);
+        add256(range_start, offset, block_start);
+        shifted_u64_256_5090(1ull, options.block_bits, block_mask);
+        uint64_t borrow = 1ull;
+        for (int i = 0; i < 4; ++i) {
+            const uint64_t old = block_mask[i];
+            block_mask[i] = old - borrow;
+            borrow = old < borrow ? 1ull : 0ull;
+        }
+        add256(block_start, block_mask, block_end);
+        const std::string child_range = formatHex256(block_start) + ":" + formatHex256(block_end);
+        std::cout << "\n[block " << (counter + 1) << "/" << total_blocks << "] permutation index "
+                  << block_index << " range " << child_range << "\n";
+        std::cout.flush();
+
+        std::vector<std::string> child_args = {
+            executable, "--range", child_range, "--grid",
+            std::to_string(batch) + "," + std::to_string(batches_per_sm),
+            "--slices", std::to_string(slices), "--random-child"
+        };
+        if (!target_hash_hex.empty()) { child_args.push_back("--target-hash160"); child_args.push_back(target_hash_hex); }
+        else { child_args.push_back("--address"); child_args.push_back(address_b58); }
+        std::vector<char*> child_argv;
+        for (std::string& argument : child_args) child_argv.push_back(argument.data());
+        child_argv.push_back(nullptr);
+
+        const pid_t child = fork();
+        if (child == 0) { execv(executable, child_argv.data()); _exit(127); }
+        if (child < 0) { std::cerr << "Error: fork failed.\n"; return EXIT_FAILURE; }
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        if (!WIFEXITED(status)) return 130;
+        const int child_status = WEXITSTATUS(status);
+        if (child_status == 10) {
+            std::cout << "Match found; current block remains uncommitted in the checkpoint.\n";
+            return EXIT_SUCCESS;
+        }
+        if (child_status != 0) {
+            std::cerr << "Block interrupted or failed (exit " << child_status << "); checkpoint not advanced.\n";
+            return child_status;
+        }
+        if (!write_checkpoint_atomic_5090(options.checkpoint, canonical_start, canonical_end,
+                                          options.block_bits, options.seed, counter + 1ull)) {
+            std::cerr << "Error: cannot advance checkpoint atomically.\n";
+            return EXIT_FAILURE;
+        }
+    }
+    std::cout << "All random-order blocks completed exactly once.\n";
+    return EXIT_SUCCESS;
+}
+
+static std::string decimal_u128_5090(unsigned __int128 value) {
+    if (value == 0) return "0";
+    std::string result;
+    while (value) {
+        result.push_back((char)('0' + value % 10));
+        value /= 10;
+    }
+    std::reverse(result.begin(), result.end());
+    return result;
+}
+#endif
+
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
     std::string target_hash_hex, range_hex, address_b58;
-    uint32_t runtime_points_batch_size = 128;
+    uint32_t runtime_points_batch_size =
+#ifdef RTX5090_OPT
+        RTX5090_BATCH;
+#else
+        128;
+#endif
     uint32_t runtime_batches_per_sm    = 8;
-    uint32_t slices_per_launch         = 64;
+    uint32_t slices_per_launch         =
+#ifdef RTX5090_OPT
+        16;
+#else
+        64;
+#endif
+#ifdef RTX5090_OPT
+    int self_test_count = 0;
+    RandomBlockOptions5090 random_blocks;
+#endif
 
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
@@ -435,7 +920,37 @@ int main(int argc, char** argv) {
             }
             slices_per_launch = (uint32_t)v;
         }
+#ifdef RTX5090_OPT
+        else if (arg == "--self-test" && i + 1 < argc) {
+            char* endp = nullptr;
+            long v = std::strtol(argv[++i], &endp, 10);
+            if (*endp != '\0' || v < 2 || v > 1000000) {
+                std::cerr << "Error: --self-test must be in 2..1000000\n";
+                return EXIT_FAILURE;
+            }
+            self_test_count = (int)v;
+        }
+        else if (arg == "--random-blocks") random_blocks.enabled = true;
+        else if (arg == "--random-child") random_blocks.child = true;
+        else if (arg == "--seed" && i + 1 < argc) {
+            char* endp = nullptr;
+            random_blocks.seed = std::strtoull(argv[++i], &endp, 0);
+            if (*endp != '\0') { std::cerr << "Error: invalid --seed.\n"; return EXIT_FAILURE; }
+            random_blocks.seed_given = true;
+        }
+        else if (arg == "--checkpoint" && i + 1 < argc) random_blocks.checkpoint = argv[++i];
+        else if (arg == "--block-bits" && i + 1 < argc) {
+            char* endp = nullptr;
+            unsigned long value = std::strtoul(argv[++i], &endp, 10);
+            if (*endp != '\0' || value > 255) { std::cerr << "Error: invalid --block-bits.\n"; return EXIT_FAILURE; }
+            random_blocks.block_bits = (unsigned int)value;
+        }
+#endif
     }
+
+#ifdef RTX5090_OPT
+    if (self_test_count) return run_hash_self_test_5090(self_test_count);
+#endif
 
     if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
         std::cerr << "Usage: " << argv[0]
@@ -469,6 +984,12 @@ int main(int argc, char** argv) {
     }
 
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
+#ifdef RTX5090_OPT
+    if (runtime_points_batch_size != RTX5090_BATCH) {
+        std::cerr << "Error: CUDACyclone-5090 was compiled for batch size " << RTX5090_BATCH << ".\n";
+        return EXIT_FAILURE;
+    }
+#endif
     if (!is_pow2(runtime_points_batch_size) || (runtime_points_batch_size & 1u)) {
         std::cerr << "Error: batch size must be even and a power of two.\n";
         return EXIT_FAILURE;
@@ -510,6 +1031,15 @@ int main(int argc, char** argv) {
         }
     }
 
+#ifdef RTX5090_OPT
+    if (random_blocks.enabled) {
+        return run_random_blocks_5090(argv[0], formatHex256(range_start), formatHex256(range_end),
+                                      range_start, range_len, target_hash_hex, address_b58,
+                                      runtime_points_batch_size, runtime_batches_per_sm,
+                                      slices_per_launch, random_blocks);
+    }
+#endif
+
     int device=0; cudaDeviceProp prop{};
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) {
         std::cerr<<"CUDA init error\n"; return EXIT_FAILURE;
@@ -517,9 +1047,16 @@ int main(int argc, char** argv) {
 
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
+#ifdef RTX5090_OPT
+    int threadsPerBlock=RTX5090_TPB;
+#else
     int threadsPerBlock=256;
+#endif
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
     if (threadsPerBlock < 32) threadsPerBlock=32;
+#ifdef RTX5090_OPT
+    const int scalarThreadsPerBlock = threadsPerBlock > 256 ? 256 : threadsPerBlock;
+#endif
 
     const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t);
     size_t totalGlobalMem = prop.totalGlobalMem;
@@ -556,18 +1093,35 @@ int main(int argc, char** argv) {
     if (userUpper         < upper) upper = userUpper;
 
     uint64_t threadsTotal = pick_threads_total(upper);
+#ifdef RTX5090_OPT
+    bool uneven_partition = false;
+    if (threadsTotal == 0ull) {
+        threadsTotal = upper - (upper % (uint64_t)threadsPerBlock);
+        uneven_partition = true;
+    }
+#endif
     if (threadsTotal == 0ull) {
         std::cerr << "Error: failed to pick threadsTotal satisfying divisibility.\n";
         return EXIT_FAILURE;
     }
     int blocks = (int)(threadsTotal / (uint64_t)threadsPerBlock);
 
-    uint64_t per_thread_cnt[4]; uint64_t r_u64 = 0ull;
+    uint64_t per_thread_cnt[4]{0,0,0,0}; uint64_t r_u64 = 0ull;
+#ifdef RTX5090_OPT
+    uint64_t base_batches_per_thread = 0ull;
+    uint64_t extra_batch_threads = 0ull;
+    if (uneven_partition) {
+        base_batches_per_thread = total_batches_u64 / threadsTotal;
+        extra_batch_threads = total_batches_u64 % threadsTotal;
+    } else
+#endif
+    {
     divmod_256_by_u64(range_len, threadsTotal, per_thread_cnt, r_u64);
     if (r_u64 != 0ull) { std::cerr << "Internal error: range_len not divisible by threadsTotal.\n"; return EXIT_FAILURE; }
     {   uint64_t qq[4], rr=0ull;
         divmod_256_by_u64(per_thread_cnt, (uint64_t)runtime_points_batch_size, qq, rr);
         if (rr != 0ull) { std::cerr << "Internal error: per-thread count is not a multiple of batch size.\n"; return EXIT_FAILURE; }
+    }
     }
 
     uint64_t* h_counts256     = nullptr;
@@ -575,14 +1129,24 @@ int main(int argc, char** argv) {
     cudaHostAlloc(&h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
     cudaHostAlloc(&h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
 
+    const uint32_t B = runtime_points_batch_size;
     for (uint64_t i = 0; i < threadsTotal; ++i) {
+#ifdef RTX5090_OPT
+        if (uneven_partition) {
+            const uint64_t batches = base_batches_per_thread + (i < extra_batch_threads ? 1ull : 0ull);
+            h_counts256[i*4+0] = batches * (uint64_t)B;
+            h_counts256[i*4+1] = 0ull;
+            h_counts256[i*4+2] = 0ull;
+            h_counts256[i*4+3] = 0ull;
+            continue;
+        }
+#endif
         h_counts256[i*4+0] = per_thread_cnt[0];
         h_counts256[i*4+1] = per_thread_cnt[1];
         h_counts256[i*4+2] = per_thread_cnt[2];
         h_counts256[i*4+3] = per_thread_cnt[3];
     }
 
-    const uint32_t B = runtime_points_batch_size;
     const uint32_t half = B >> 1;
     {
         uint64_t cur[4] = { range_start[0], range_start[1], range_start[2], range_start[3] };
@@ -593,7 +1157,13 @@ int main(int argc, char** argv) {
             h_start_scalars[i*4+2] = Sc[2];
             h_start_scalars[i*4+3] = Sc[3];
 
+#ifdef RTX5090_OPT
+            uint64_t next[4];
+            if (uneven_partition) add256_u64(cur, h_counts256[i*4+0], next);
+            else add256(cur, per_thread_cnt, next);
+#else
             uint64_t next[4]; add256(cur, per_thread_cnt, next);
+#endif
             cur[0]=next[0]; cur[1]=next[1]; cur[2]=next[2]; cur[3]=next[3];
         }
     }
@@ -605,6 +1175,16 @@ int main(int argc, char** argv) {
                            | ((uint32_t)target_hash160[3] << 24);
         cudaMemcpyToSymbol(c_target_prefix, &prefix_le, sizeof(prefix_le));
         cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
+#ifdef RTX5090_OPT
+        uint32_t target_words[5];
+        for (int i = 0; i < 5; ++i) {
+            target_words[i] = (uint32_t)target_hash160[4*i + 0]
+                            | ((uint32_t)target_hash160[4*i + 1] << 8)
+                            | ((uint32_t)target_hash160[4*i + 2] << 16)
+                            | ((uint32_t)target_hash160[4*i + 3] << 24);
+        }
+        cudaMemcpyToSymbol(c_target_hash160_words, target_words, sizeof(target_words));
+#endif
     }
 
     uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
@@ -636,8 +1216,13 @@ int main(int argc, char** argv) {
       ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes_accum"); }
 
     {
+#ifdef RTX5090_OPT
+        int blocks_scal = (int)((threadsTotal + scalarThreadsPerBlock - 1) / scalarThreadsPerBlock);
+        scalarMulKernelBase<<<blocks_scal, scalarThreadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
+#else
         int blocks_scal = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
+#endif
         ck(cudaDeviceSynchronize(), "scalarMulKernelBase sync");
         ck(cudaGetLastError(), "scalarMulKernelBase launch");
     }
@@ -654,8 +1239,13 @@ int main(int argc, char** argv) {
         ck(cudaMalloc(&d_Gy_half,      (size_t)half * 4 * sizeof(uint64_t)), "cudaMalloc(d_Gy_half)");
         ck(cudaMemcpy(d_scalars_half, h_scalars_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy half scalars");
 
+#ifdef RTX5090_OPT
+        int blocks_scal = (int)((half + scalarThreadsPerBlock - 1) / scalarThreadsPerBlock);
+        scalarMulKernelBase<<<blocks_scal, scalarThreadsPerBlock>>>(d_scalars_half, d_Gx_half, d_Gy_half, (int)half);
+#else
         int blocks_scal = (int)((half + threadsPerBlock - 1) / threadsPerBlock);
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_scalars_half, d_Gx_half, d_Gy_half, (int)half);
+#endif
         ck(cudaDeviceSynchronize(), "scalarMulKernelBase(half) sync");
         ck(cudaGetLastError(), "scalarMulKernelBase(half) launch");
 
@@ -699,6 +1289,12 @@ int main(int argc, char** argv) {
     size_t freeB=0,totalB=0; cudaMemGetInfo(&freeB,&totalB);
     size_t usedB = totalB - freeB;
     double util = totalB ? (double)usedB * 100.0 / (double)totalB : 0.0;
+#ifdef RTX5090_OPT
+    int activeBlocksPerSm = 0;
+    ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+           &activeBlocksPerSm, kernel_point_add_and_check_oneinv<RTX5090_BATCH>, threadsPerBlock, 0),
+       "cudaOccupancyMaxActiveBlocksPerMultiprocessor");
+#endif
 
     std::cout << "======== PrePhase: GPU Information ====================\n";
     std::cout << std::left << std::setw(20) << "Device"            << " : " << prop.name << " (compute " << prop.major << "." << prop.minor << ")\n";
@@ -713,16 +1309,27 @@ int main(int argc, char** argv) {
               << human_bytes((double)usedB) << " / " << human_bytes((double)totalB) << ")\n";
     std::cout << "------------------------------------------------------- \n";
     std::cout << std::left << std::setw(20) << "Total threads"     << " : " << (uint64_t)threadsTotal << "\n\n";
+#ifdef RTX5090_OPT
+    std::cout << std::left << std::setw(20) << "Active blocks/SM"  << " : " << activeBlocksPerSm
+              << " (theoretical, " << (activeBlocksPerSm * threadsPerBlock / WARP_SIZE) << " warps/SM)\n\n";
+#endif
     std::cout << "======== Phase-1: BruteForce ==========================\n";
 
     cudaStream_t streamKernel;
     ck(cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking), "create stream");
 
+#ifdef RTX5090_OPT
+    (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<RTX5090_BATCH>, cudaFuncCachePreferL1);
+#else
     (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv, cudaFuncCachePreferL1);
+#endif
 
     auto t0 = std::chrono::high_resolution_clock::now();
     auto tLast = t0;
     unsigned long long lastHashes = 0ull;
+#ifdef RTX5090_OPT
+    unsigned long long hashCounterWraps = 0ull;
+#endif
 
     bool stop_all = false;
     bool completed_all = false;
@@ -732,11 +1339,17 @@ int main(int argc, char** argv) {
         unsigned int zeroU = 0u;
         ck(cudaMemcpyAsync(d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, streamKernel), "zero d_any_left");
 
+#ifdef RTX5090_OPT
+        kernel_point_add_and_check_oneinv<RTX5090_BATCH><<<blocks, threadsPerBlock, 0, streamKernel>>>(
+#else
         kernel_point_add_and_check_oneinv<<<blocks, threadsPerBlock, 0, streamKernel>>>(
+#endif
             d_Px, d_Py, d_Rx, d_Ry,
             d_start_scalars, d_counts256,
             threadsTotal,
+#ifndef RTX5090_OPT
             B,
+#endif
             slices_per_launch,
             d_found_flag, d_found_result,
             d_hashes_accum,
@@ -758,11 +1371,22 @@ int main(int argc, char** argv) {
                 double mkeys = delta / (dt * 1e6);
                 double elapsed = std::chrono::duration<double>(now - t0).count();
                 long double total_keys_ld = ld_from_u256(range_len);
+#ifdef RTX5090_OPT
+                if (h_hashes < lastHashes) ++hashCounterWraps;
+                const unsigned __int128 exact_hashes = ((unsigned __int128)hashCounterWraps << 64) | h_hashes;
+                const long double exact_hashes_ld = std::ldexp((long double)hashCounterWraps, 64) + (long double)h_hashes;
+                long double prog = total_keys_ld > 0.0L ? (exact_hashes_ld / total_keys_ld) * 100.0L : 0.0L;
+#else
                 long double prog = total_keys_ld > 0.0L ? ((long double)h_hashes / total_keys_ld) * 100.0L : 0.0L;
+#endif
                 if (prog > 100.0L) prog = 100.0L;
                 std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
                           << " s | Speed: " << std::fixed << std::setprecision(1) << mkeys
+#ifdef RTX5090_OPT
+                          << " Mkeys/s | Count: " << decimal_u128_5090(exact_hashes)
+#else
                           << " Mkeys/s | Count: " << h_hashes
+#endif
                           << " | Progress: " << std::fixed << std::setprecision(2) << (double)prog << " %";
                 std::cout.flush();
                 lastHashes = h_hashes; tLast = now;
@@ -795,10 +1419,30 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
     std::cout << "\n";
 
+#ifdef RTX5090_OPT
+    bool counter_integrity_error = false;
+    unsigned long long final_hashes = 0ull;
+    ck(cudaMemcpy(&final_hashes, d_hashes_accum, sizeof(final_hashes), cudaMemcpyDeviceToHost), "final read hashes");
+    if (final_hashes < lastHashes) ++hashCounterWraps;
+    const unsigned __int128 exact_final_hashes = ((unsigned __int128)hashCounterWraps << 64) | final_hashes;
+    std::cout << "Final count         : " << decimal_u128_5090(exact_final_hashes) << "\n";
+    const bool range_count_fits_u128 = (range_len[2] | range_len[3]) == 0ull;
+    const unsigned __int128 expected_hashes = ((unsigned __int128)range_len[1] << 64) | range_len[0];
+    if (completed_all && range_count_fits_u128 && exact_final_hashes != expected_hashes) {
+        std::cerr << "Counter integrity error: exhaustive range contains " << decimal_u128_5090(expected_hashes)
+                  << " keys but device counted " << decimal_u128_5090(exact_final_hashes) << ".\n";
+        counter_integrity_error = true;
+    }
+#endif
+
     int h_found_flag = 0;
     ck(cudaMemcpy(&h_found_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost), "final read found_flag");
 
+#ifdef RTX5090_OPT
+    int exit_code = counter_integrity_error ? EXIT_FAILURE : EXIT_SUCCESS;
+#else
     int exit_code = EXIT_SUCCESS;
+#endif
 
     if (h_found_flag == FOUND_READY) {
         FoundResult host_result{};
@@ -806,6 +1450,9 @@ int main(int argc, char** argv) {
         std::cout << "\n======== FOUND MATCH! =================================\n";
         std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
         std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
+#ifdef RTX5090_OPT
+        if (random_blocks.child) exit_code = 10;
+#endif
     } else {
         if (g_sigint) {
             std::cout << "======== INTERRUPTED (Ctrl+C) ==========================\n";

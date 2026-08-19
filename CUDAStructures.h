@@ -13,6 +13,9 @@ struct FoundResult {
 
 __device__ __constant__ uint8_t  c_target_hash160[20];
 __device__ __constant__ uint32_t c_target_prefix;
+#ifdef RTX5090_OPT
+__device__ __constant__ uint32_t c_target_hash160_words[5];
+#endif
 
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 

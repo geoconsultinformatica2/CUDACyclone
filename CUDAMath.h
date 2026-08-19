@@ -124,7 +124,12 @@ __device__ void ShiftR62(uint64_t r[5]) {
 
 }
 
-__device__ void ModSub256isOdd(uint64_t* a, uint64_t* b, uint8_t* parity) {    //no need to compute py, we need only parity
+#ifdef RTX5090_OPT
+__device__ __forceinline__
+#else
+__device__
+#endif
+void ModSub256isOdd(uint64_t* a, uint64_t* b, uint8_t* parity) {    //no need to compute py, we need only parity
 
     uint64_t t;   
     uint64_t T[4]; 

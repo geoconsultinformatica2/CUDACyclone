@@ -499,3 +499,77 @@ __device__ __noinline__ void getHash160_33_from_limbs(uint8_t prefix02_03,
     SHA256_33_from_limbs(prefix02_03, x_be_limbs, sha_state);
     RIPEMD160_from_SHA256_state(sha_state, out20);
 }
+
+#ifdef RTX5090_OPT
+// Fixed one-block SHA-256 for a 33-byte compressed secp256k1 public key.
+// x_le_limbs is the native field representation: limb 0 is least significant.
+__device__ __forceinline__ void getSHA256_33_from_limbs_5090(
+    uint8_t prefix02_03,
+    const uint64_t x_le_limbs[4],
+    uint32_t out_state[8])
+{
+    const uint64_t v3 = x_le_limbs[3];
+    const uint64_t v2 = x_le_limbs[2];
+    const uint64_t v1 = x_le_limbs[1];
+    const uint64_t v0 = x_le_limbs[0];
+    uint32_t w[16];
+    w[0] = pack_be4(prefix02_03, (uint8_t)(v3 >> 56), (uint8_t)(v3 >> 48), (uint8_t)(v3 >> 40));
+    w[1] = pack_be4((uint8_t)(v3 >> 32), (uint8_t)(v3 >> 24), (uint8_t)(v3 >> 16), (uint8_t)(v3 >> 8));
+    w[2] = pack_be4((uint8_t)v3, (uint8_t)(v2 >> 56), (uint8_t)(v2 >> 48), (uint8_t)(v2 >> 40));
+    w[3] = pack_be4((uint8_t)(v2 >> 32), (uint8_t)(v2 >> 24), (uint8_t)(v2 >> 16), (uint8_t)(v2 >> 8));
+    w[4] = pack_be4((uint8_t)v2, (uint8_t)(v1 >> 56), (uint8_t)(v1 >> 48), (uint8_t)(v1 >> 40));
+    w[5] = pack_be4((uint8_t)(v1 >> 32), (uint8_t)(v1 >> 24), (uint8_t)(v1 >> 16), (uint8_t)(v1 >> 8));
+    w[6] = pack_be4((uint8_t)v1, (uint8_t)(v0 >> 56), (uint8_t)(v0 >> 48), (uint8_t)(v0 >> 40));
+    w[7] = pack_be4((uint8_t)(v0 >> 32), (uint8_t)(v0 >> 24), (uint8_t)(v0 >> 16), (uint8_t)(v0 >> 8));
+    w[8] = pack_be4((uint8_t)v0, 0x80u, 0u, 0u);
+#pragma unroll
+    for (int i = 9; i < 15; ++i) w[i] = 0u;
+    w[15] = 264u;
+
+    uint32_t a = 0x6a09e667u, b = 0xbb67ae85u, c = 0x3c6ef372u, d = 0xa54ff53au;
+    uint32_t e = 0x510e527fu, f = 0x9b05688cu, g = 0x1f83d9abu, h = 0x5be0cd19u;
+#pragma unroll 64
+    for (int t = 0; t < 64; ++t) {
+        if (t >= 16) {
+            const uint32_t s0 = smallS0(w[(t + 1) & 15]);
+            const uint32_t s1 = smallS1(w[(t + 14) & 15]);
+            w[t & 15] += s1 + w[(t + 9) & 15] + s0;
+        }
+        const uint32_t t1 = h + bigS1(e) + Ch(e, f, g) + K[t] + w[t & 15];
+        const uint32_t t2 = bigS0(a) + Maj(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    out_state[0] = 0x6a09e667u + a;
+    out_state[1] = 0xbb67ae85u + b;
+    out_state[2] = 0x3c6ef372u + c;
+    out_state[3] = 0xa54ff53au + d;
+    out_state[4] = 0x510e527fu + e;
+    out_state[5] = 0x9b05688cu + f;
+    out_state[6] = 0x1f83d9abu + g;
+    out_state[7] = 0x5be0cd19u + h;
+}
+
+// RIPEMD-160 always receives the 32-byte SHA-256 digest. Its final five
+// uint32_t words are already the little-endian word view of HASH160.
+__device__ __forceinline__ void getHash160_33_from_limbs_5090(
+    uint8_t prefix02_03,
+    const uint64_t x_le_limbs[4],
+    uint32_t out_words[5])
+{
+    uint32_t sha[8];
+    getSHA256_33_from_limbs_5090(prefix02_03, x_le_limbs, sha);
+
+    uint32_t w[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) w[i] = bswap32(sha[i]);
+    w[8] = 0x00000080u;
+#pragma unroll
+    for (int i = 9; i < 14; ++i) w[i] = 0u;
+    w[14] = 256u;
+    w[15] = 0u;
+
+    RIPEMD160Initialize(out_words);
+    RIPEMD160Transform(out_words, w);
+}
+#endif
