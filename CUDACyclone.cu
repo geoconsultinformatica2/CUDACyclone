@@ -636,7 +636,11 @@ struct RandomBlockOptions5090 {
     bool enabled = false;
     bool child = false;
     bool seed_given = false;
+    bool workers_given = false;
+    bool worker_id_given = false;
     uint64_t seed = 0;
+    uint64_t workers = 1;
+    uint64_t worker_id = 0;
     unsigned int block_bits = 37;
     std::string checkpoint = "cudacyclone-p71.checkpoint";
 };
@@ -647,7 +651,9 @@ static bool write_checkpoint_atomic_5090(
     const std::string& range_end,
     unsigned int block_bits,
     uint64_t seed,
-    uint64_t next_counter)
+    uint64_t next_counter,
+    uint64_t workers,
+    uint64_t worker_id)
 {
     std::ostringstream contents;
     contents << "version=1\n"
@@ -655,7 +661,9 @@ static bool write_checkpoint_atomic_5090(
              << "range_end=" << range_end << "\n"
              << "block_bits=" << block_bits << "\n"
              << "seed=" << seed << "\n"
-             << "next_counter=" << next_counter << "\n";
+             << "next_counter=" << next_counter << "\n"
+             << "workers=" << workers << "\n"
+             << "worker_id=" << worker_id << "\n";
     const std::string data = contents.str();
     const std::string temporary = path + ".tmp." + std::to_string((unsigned long long)getpid());
     const int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -685,6 +693,21 @@ static bool read_checkpoint_5090(const std::string& path, std::map<std::string,s
         if (equals != std::string::npos) values[line.substr(0, equals)] = line.substr(equals + 1);
     }
     return values["version"] == "1";
+}
+
+static bool first_worker_counter_5090(
+    uint64_t minimum,
+    uint64_t workers,
+    uint64_t worker_id,
+    uint64_t& result)
+{
+    const uint64_t remainder = minimum % workers;
+    const uint64_t delta = worker_id >= remainder
+        ? worker_id - remainder
+        : workers - (remainder - worker_id);
+    if (minimum > (~uint64_t{0}) - delta) return false;
+    result = minimum + delta;
+    return true;
 }
 
 static void shifted_u64_256_5090(uint64_t value, unsigned int shift, uint64_t out[4]) {
@@ -729,9 +752,12 @@ static int run_random_blocks_5090(
     const uint64_t total_blocks = index_bits == 0 ? 1ull : (1ull << index_bits);
     const uint64_t index_mask = total_blocks - 1ull;
     uint64_t next_counter = 0ull;
+    bool checkpoint_loaded = false;
+    bool checkpoint_has_worker_metadata = false;
 
     std::map<std::string,std::string> saved;
     if (read_checkpoint_5090(options.checkpoint, saved)) {
+        checkpoint_loaded = true;
         try {
             if (saved["range_start"] != canonical_start || saved["range_end"] != canonical_end
                 || std::stoul(saved["block_bits"]) != options.block_bits) {
@@ -745,6 +771,27 @@ static int run_random_blocks_5090(
             }
             options.seed = saved_seed;
             next_counter = std::stoull(saved["next_counter"]);
+            const bool has_workers = saved.find("workers") != saved.end();
+            const bool has_worker_id = saved.find("worker_id") != saved.end();
+            if (has_workers != has_worker_id) {
+                std::cerr << "Error: checkpoint has incomplete worker metadata.\n";
+                return EXIT_FAILURE;
+            }
+            if (has_workers) {
+                checkpoint_has_worker_metadata = true;
+                const uint64_t saved_workers = std::stoull(saved["workers"]);
+                const uint64_t saved_worker_id = std::stoull(saved["worker_id"]);
+                if (saved_workers == 0 || saved_worker_id >= saved_workers) {
+                    std::cerr << "Error: checkpoint has invalid worker metadata.\n";
+                    return EXIT_FAILURE;
+                }
+                if (saved_workers != options.workers || saved_worker_id != options.worker_id) {
+                    std::cerr << "Error: checkpoint belongs to worker " << saved_worker_id
+                              << " of " << saved_workers << ", not worker " << options.worker_id
+                              << " of " << options.workers << ".\n";
+                    return EXIT_FAILURE;
+                }
+            }
         } catch (...) {
             std::cerr << "Error: invalid checkpoint contents.\n";
             return EXIT_FAILURE;
@@ -754,19 +801,52 @@ static int run_random_blocks_5090(
             std::cerr << "Error: checkpoint exists but is invalid.\n";
             return EXIT_FAILURE;
         }
+        if (options.workers > 1 && !options.seed_given) {
+            std::cerr << "Error: --seed is required for a new distributed-worker checkpoint.\n";
+            return EXIT_FAILURE;
+        }
         if (!options.seed_given) {
             options.seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count()
                          ^ ((uint64_t)getpid() << 32);
         }
-        if (!write_checkpoint_atomic_5090(options.checkpoint, canonical_start, canonical_end,
-                                          options.block_bits, options.seed, next_counter)) {
-            std::cerr << "Error: cannot create checkpoint " << options.checkpoint << ": " << std::strerror(errno) << "\n";
+    }
+    if (!checkpoint_has_worker_metadata && next_counter > total_blocks) {
+        std::cerr << "Error: checkpoint counter exceeds total block count.\n";
+        return EXIT_FAILURE;
+    }
+    if (checkpoint_has_worker_metadata) {
+        if ((next_counter % options.workers) != options.worker_id) {
+            std::cerr << "Error: checkpoint next_counter does not belong to this worker.\n";
+            return EXIT_FAILURE;
+        }
+        uint64_t terminal_counter = options.worker_id;
+        if (options.worker_id < total_blocks) {
+            const uint64_t last_counter = options.worker_id
+                + ((total_blocks - 1ull - options.worker_id) / options.workers) * options.workers;
+            if (last_counter > (~uint64_t{0}) - options.workers) {
+                std::cerr << "Error: worker counter stride overflows uint64.\n";
+                return EXIT_FAILURE;
+            }
+            terminal_counter = last_counter + options.workers;
+        }
+        if (next_counter > terminal_counter) {
+            std::cerr << "Error: checkpoint counter exceeds this worker's terminal counter.\n";
             return EXIT_FAILURE;
         }
     }
-    if (next_counter > total_blocks) {
-        std::cerr << "Error: checkpoint counter exceeds total block count.\n";
+
+    uint64_t starting_counter = 0ull;
+    if (!first_worker_counter_5090(next_counter, options.workers, options.worker_id, starting_counter)) {
+        std::cerr << "Error: starting worker counter overflows uint64.\n";
         return EXIT_FAILURE;
+    }
+    if (!checkpoint_loaded) {
+        if (!write_checkpoint_atomic_5090(options.checkpoint, canonical_start, canonical_end,
+                                          options.block_bits, options.seed, starting_counter,
+                                          options.workers, options.worker_id)) {
+            std::cerr << "Error: cannot create checkpoint " << options.checkpoint << ": " << std::strerror(errno) << "\n";
+            return EXIT_FAILURE;
+        }
     }
 
     uint64_t mix = options.seed;
@@ -785,9 +865,13 @@ static int run_random_blocks_5090(
               << "Block bits          : " << options.block_bits << "\n"
               << "Total blocks        : " << total_blocks << "\n"
               << "Resume counter      : " << next_counter << "\n"
-              << "Checkpoint          : " << options.checkpoint << "\n";
+              << "Checkpoint          : " << options.checkpoint << "\n"
+              << "Distributed workers : " << options.workers << "\n"
+              << "Worker ID           : " << options.worker_id << "\n"
+              << "Counter stride      : " << options.workers << "\n"
+              << "Starting counter    : " << starting_counter << "\n";
 
-    for (uint64_t counter = next_counter; counter < total_blocks; ++counter) {
+    for (uint64_t counter = starting_counter; counter < total_blocks; ) {
         const uint64_t block_index = (multiplier * counter + addend) & index_mask;
         uint64_t offset[4], block_start[4], block_end[4], block_mask[4];
         shifted_u64_256_5090(block_index, options.block_bits, offset);
@@ -801,7 +885,8 @@ static int run_random_blocks_5090(
         }
         add256(block_start, block_mask, block_end);
         const std::string child_range = formatHex256(block_start) + ":" + formatHex256(block_end);
-        std::cout << "\n[block " << (counter + 1) << "/" << total_blocks << "] permutation index "
+        std::cout << "\n[worker " << options.worker_id << ", counter " << counter
+                  << ", block " << (counter + 1) << "/" << total_blocks << "] permutation index "
                   << block_index << " range " << child_range << "\n";
         std::cout.flush();
 
@@ -831,13 +916,21 @@ static int run_random_blocks_5090(
             std::cerr << "Block interrupted or failed (exit " << child_status << "); checkpoint not advanced.\n";
             return child_status;
         }
+        if (counter > (~uint64_t{0}) - options.workers) {
+            std::cerr << "Error: worker counter stride overflows uint64.\n";
+            return EXIT_FAILURE;
+        }
+        const uint64_t following_counter = counter + options.workers;
         if (!write_checkpoint_atomic_5090(options.checkpoint, canonical_start, canonical_end,
-                                          options.block_bits, options.seed, counter + 1ull)) {
+                                          options.block_bits, options.seed, following_counter,
+                                          options.workers, options.worker_id)) {
             std::cerr << "Error: cannot advance checkpoint atomically.\n";
             return EXIT_FAILURE;
         }
+        counter = following_counter;
     }
-    std::cout << "All random-order blocks completed exactly once.\n";
+    if (options.workers == 1) std::cout << "All random-order blocks completed exactly once.\n";
+    else std::cout << "Worker " << options.worker_id << " completed its disjoint random-order counter set.\n";
     return EXIT_SUCCESS;
 }
 
@@ -945,16 +1038,52 @@ int main(int argc, char** argv) {
             if (*endp != '\0' || value > 255) { std::cerr << "Error: invalid --block-bits.\n"; return EXIT_FAILURE; }
             random_blocks.block_bits = (unsigned int)value;
         }
+        else if (arg == "--workers" && i + 1 < argc) {
+            char* endp = nullptr;
+            errno = 0;
+            const char* value = argv[++i];
+            const unsigned long long parsed = std::strtoull(value, &endp, 10);
+            if (*value == '-' || *endp != '\0' || errno == ERANGE || parsed == 0ull) {
+                std::cerr << "Error: --workers must be a positive integer.\n";
+                return EXIT_FAILURE;
+            }
+            random_blocks.workers = (uint64_t)parsed;
+            random_blocks.workers_given = true;
+        }
+        else if (arg == "--worker-id" && i + 1 < argc) {
+            char* endp = nullptr;
+            errno = 0;
+            const char* value = argv[++i];
+            const unsigned long long parsed = std::strtoull(value, &endp, 10);
+            if (*value == '-' || *endp != '\0' || errno == ERANGE) {
+                std::cerr << "Error: --worker-id must be a non-negative integer.\n";
+                return EXIT_FAILURE;
+            }
+            random_blocks.worker_id = (uint64_t)parsed;
+            random_blocks.worker_id_given = true;
+        }
 #endif
     }
 
 #ifdef RTX5090_OPT
+    if ((random_blocks.workers_given || random_blocks.worker_id_given) && !random_blocks.enabled) {
+        std::cerr << "Error: --workers and --worker-id require --random-blocks.\n";
+        return EXIT_FAILURE;
+    }
+    if (random_blocks.enabled && random_blocks.worker_id >= random_blocks.workers) {
+        std::cerr << "Error: --worker-id must be less than --workers.\n";
+        return EXIT_FAILURE;
+    }
     if (self_test_count) return run_hash_self_test_5090(self_test_count);
 #endif
 
     if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]\n";
+                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]";
+#ifdef RTX5090_OPT
+        std::cerr << " [--random-blocks [--seed S] [--checkpoint FILE] [--block-bits B] [--workers N --worker-id I]]";
+#endif
+        std::cerr << "\n";
         return EXIT_FAILURE;
     }
     if (!target_hash_hex.empty() && !address_b58.empty()) {
