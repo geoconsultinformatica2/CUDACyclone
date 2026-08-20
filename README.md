@@ -77,6 +77,11 @@ Done. Results in cyclone_tests_results.txt. Successes=848 Failures=0
 - **--target-hash160**: the same as address but hash160.
 - **--grid**: very usefull parameter. Example --grid 512,512 - first 512 - number of points each thread will process in one batch (Points batch size)., second 512 - number of threads in one group (Threads per batch).
 - **--slices**: batch per thread for one kernel launch.
+- **--found-file PATH** (optimized RTX 5090 build): atomically publish a machine-readable `KEY=VALUE` solution record. On Linux the file is restricted to mode `0600`; an existing file is never overwritten.
+
+When `--found-file` is supplied and a key is found, CUDACyclone writes the private key, compressed public key, HASH160, worker identity, current block, and any available random-block permutation metadata, then exits with status `42`. An exhaustive miss does not create the file. Without this option, discovery and exit behavior are unchanged.
+
+The writer uses `PATH.tmp.<pid>`, flushes it with `fsync`, closes it, and atomically publishes it without replacing an existing result. Linux filesystems that cannot enforce private owner-only permissions are rejected.
 
 ---
 

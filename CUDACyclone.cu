@@ -18,14 +18,16 @@
 #include <vector>
 #ifdef RTX5090_OPT
 #include <cerrno>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 #include "CUDAMath.h"
@@ -481,6 +483,163 @@ extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
 #ifdef RTX5090_OPT
+static constexpr int FOUND_FILE_EXIT_CODE = 42;
+
+enum class FoundFileWriteStatus {
+    Written,
+    AlreadyExists,
+    Error
+};
+
+struct FoundFileRecord {
+    uint64_t workers = 1;
+    uint64_t worker_id = 0;
+    bool has_permutation = false;
+    uint64_t permutation_counter = 0;
+    uint64_t permutation_index = 0;
+    std::string block_start;
+    std::string block_end;
+    std::string private_key;
+    std::string public_key_compressed;
+    std::string hash160;
+    std::string address;
+};
+
+static std::string utc_timestamp_5090() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+    if (now == (std::time_t)-1 || gmtime_r(&now, &utc) == nullptr) return {};
+    char timestamp[32];
+    if (std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc) == 0) return {};
+    return timestamp;
+}
+
+static int rename_noreplace_5090(const char* source, const char* destination) {
+#if defined(SYS_renameat2)
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
+    int result;
+    do {
+        result = (int)syscall(SYS_renameat2, AT_FDCWD, source, AT_FDCWD, destination,
+                              RENAME_NOREPLACE);
+    } while (result != 0 && errno == EINTR);
+    if (result == 0 || (errno != ENOSYS && errno != EINVAL)) return result;
+#endif
+    if (link(source, destination) != 0) return -1;
+    (void)unlink(source);
+    return 0;
+}
+
+static FoundFileWriteStatus write_found_file_atomic_5090(
+    const std::string& path,
+    const FoundFileRecord& record)
+{
+    struct stat existing_status{};
+    if (lstat(path.c_str(), &existing_status) == 0) return FoundFileWriteStatus::AlreadyExists;
+    if (errno != ENOENT) return FoundFileWriteStatus::Error;
+
+    std::ostringstream contents;
+    contents << "FOUND=1\n";
+    const std::string timestamp = utc_timestamp_5090();
+    if (!timestamp.empty()) contents << "TIMESTAMP_UTC=" << timestamp << "\n";
+    contents << "WORKERS=" << record.workers << "\n"
+             << "WORKER_ID=" << record.worker_id << "\n";
+    if (record.has_permutation) {
+        contents << "PERMUTATION_COUNTER=" << record.permutation_counter << "\n"
+                 << "PERMUTATION_INDEX=" << record.permutation_index << "\n";
+    }
+    if (!record.block_start.empty()) contents << "BLOCK_START=" << record.block_start << "\n";
+    if (!record.block_end.empty()) contents << "BLOCK_END=" << record.block_end << "\n";
+    contents << "PRIVATE_KEY=" << record.private_key << "\n"
+             << "PUBLIC_KEY_COMPRESSED=" << record.public_key_compressed << "\n"
+             << "HASH160=" << record.hash160 << "\n";
+    if (!record.address.empty()) contents << "ADDRESS=" << record.address << "\n";
+    const std::string data = contents.str();
+
+    const std::string temporary = path + ".tmp." + std::to_string((unsigned long long)getpid());
+    int open_flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+    open_flags |= O_CLOEXEC;
+#endif
+    const int fd = open(temporary.c_str(), open_flags, 0600);
+    if (fd < 0) return FoundFileWriteStatus::Error;
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        const int saved_errno = errno;
+        close(fd);
+        unlink(temporary.c_str());
+        errno = saved_errno;
+        return FoundFileWriteStatus::Error;
+    }
+    struct stat temp_status{};
+    if (fstat(fd, &temp_status) != 0) {
+        const int saved_errno = errno;
+        close(fd);
+        unlink(temporary.c_str());
+        errno = saved_errno;
+        return FoundFileWriteStatus::Error;
+    }
+    if ((temp_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        close(fd);
+        unlink(temporary.c_str());
+        errno = EACCES;
+        return FoundFileWriteStatus::Error;
+    }
+
+    size_t written = 0;
+    while (written < data.size()) {
+        const ssize_t amount = write(fd, data.data() + written, data.size() - written);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) {
+            const int saved_errno = amount == 0 ? EIO : errno;
+            close(fd);
+            unlink(temporary.c_str());
+            errno = saved_errno;
+            return FoundFileWriteStatus::Error;
+        }
+        written += (size_t)amount;
+    }
+    if (fsync(fd) != 0) {
+        const int saved_errno = errno;
+        close(fd);
+        unlink(temporary.c_str());
+        errno = saved_errno;
+        return FoundFileWriteStatus::Error;
+    }
+    if (close(fd) != 0) {
+        const int saved_errno = errno;
+        unlink(temporary.c_str());
+        errno = saved_errno;
+        return FoundFileWriteStatus::Error;
+    }
+
+    if (rename_noreplace_5090(temporary.c_str(), path.c_str()) != 0) {
+        const int saved_errno = errno;
+        unlink(temporary.c_str());
+        errno = saved_errno;
+        return saved_errno == EEXIST
+            ? FoundFileWriteStatus::AlreadyExists
+            : FoundFileWriteStatus::Error;
+    }
+
+    std::filesystem::path found_path(path);
+    std::filesystem::path parent = found_path.parent_path();
+    if (parent.empty()) parent = ".";
+    const int directory_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if (directory_fd >= 0) {
+        (void)fsync(directory_fd);
+        (void)close(directory_fd);
+    }
+    return FoundFileWriteStatus::Written;
+}
+
+static std::string format_hash160_5090(const uint8_t hash160[20]) {
+    std::ostringstream formatted;
+    formatted << std::hex << std::uppercase << std::setfill('0');
+    for (int i = 0; i < 20; ++i) formatted << std::setw(2) << (unsigned int)hash160[i];
+    return formatted.str();
+}
+
 struct HashSelfTestSummary {
     unsigned int pubkey_mismatches;
     unsigned int sha256_mismatches;
@@ -638,11 +797,16 @@ struct RandomBlockOptions5090 {
     bool seed_given = false;
     bool workers_given = false;
     bool worker_id_given = false;
+    bool permutation_counter_given = false;
+    bool permutation_index_given = false;
     uint64_t seed = 0;
     uint64_t workers = 1;
     uint64_t worker_id = 0;
+    uint64_t permutation_counter = 0;
+    uint64_t permutation_index = 0;
     unsigned int block_bits = 37;
     std::string checkpoint = "cudacyclone-p71.checkpoint";
+    std::string found_file;
 };
 
 static bool write_checkpoint_atomic_5090(
@@ -897,6 +1061,18 @@ static int run_random_blocks_5090(
         };
         if (!target_hash_hex.empty()) { child_args.push_back("--target-hash160"); child_args.push_back(target_hash_hex); }
         else { child_args.push_back("--address"); child_args.push_back(address_b58); }
+        if (!options.found_file.empty()) {
+            child_args.push_back("--found-file");
+            child_args.push_back(options.found_file);
+            child_args.push_back("--workers");
+            child_args.push_back(std::to_string(options.workers));
+            child_args.push_back("--worker-id");
+            child_args.push_back(std::to_string(options.worker_id));
+            child_args.push_back("--permutation-counter");
+            child_args.push_back(std::to_string(counter));
+            child_args.push_back("--permutation-index");
+            child_args.push_back(std::to_string(block_index));
+        }
         std::vector<char*> child_argv;
         for (std::string& argument : child_args) child_argv.push_back(argument.data());
         child_argv.push_back(nullptr);
@@ -911,6 +1087,12 @@ static int run_random_blocks_5090(
         if (child_status == 10) {
             std::cout << "Match found; current block remains uncommitted in the checkpoint.\n";
             return EXIT_SUCCESS;
+        }
+        if (child_status == FOUND_FILE_EXIT_CODE && !options.found_file.empty()) {
+            std::cout << "Match found; current block remains uncommitted in the checkpoint.\n";
+            std::cout.flush();
+            std::cerr.flush();
+            return FOUND_FILE_EXIT_CODE;
         }
         if (child_status != 0) {
             std::cerr << "Block interrupted or failed (exit " << child_status << "); checkpoint not advanced.\n";
@@ -965,6 +1147,7 @@ int main(int argc, char** argv) {
 #endif
 #ifdef RTX5090_OPT
     int self_test_count = 0;
+    std::string found_file;
     RandomBlockOptions5090 random_blocks;
 #endif
 
@@ -995,6 +1178,15 @@ int main(int argc, char** argv) {
         if      (arg == "--target-hash160" && i + 1 < argc) target_hash_hex = argv[++i];
         else if (arg == "--address"        && i + 1 < argc) address_b58     = argv[++i];
         else if (arg == "--range"          && i + 1 < argc) range_hex       = argv[++i];
+#ifdef RTX5090_OPT
+        else if (arg == "--found-file"     && i + 1 < argc) {
+            found_file = argv[++i];
+            if (found_file.empty()) {
+                std::cerr << "Error: --found-file PATH must not be empty.\n";
+                return EXIT_FAILURE;
+            }
+        }
+#endif
         else if (arg == "--grid"           && i + 1 < argc) {
             uint32_t a=0,b=0;
             if (!parse_grid(argv[++i], a, b)) {
@@ -1062,16 +1254,52 @@ int main(int argc, char** argv) {
             random_blocks.worker_id = (uint64_t)parsed;
             random_blocks.worker_id_given = true;
         }
+        else if (arg == "--permutation-counter" && i + 1 < argc) {
+            char* endp = nullptr;
+            errno = 0;
+            const char* value = argv[++i];
+            const unsigned long long parsed = std::strtoull(value, &endp, 10);
+            if (*value == '-' || *endp != '\0' || errno == ERANGE) {
+                std::cerr << "Error: invalid --permutation-counter.\n";
+                return EXIT_FAILURE;
+            }
+            random_blocks.permutation_counter = (uint64_t)parsed;
+            random_blocks.permutation_counter_given = true;
+        }
+        else if (arg == "--permutation-index" && i + 1 < argc) {
+            char* endp = nullptr;
+            errno = 0;
+            const char* value = argv[++i];
+            const unsigned long long parsed = std::strtoull(value, &endp, 10);
+            if (*value == '-' || *endp != '\0' || errno == ERANGE) {
+                std::cerr << "Error: invalid --permutation-index.\n";
+                return EXIT_FAILURE;
+            }
+            random_blocks.permutation_index = (uint64_t)parsed;
+            random_blocks.permutation_index_given = true;
+        }
 #endif
     }
 
 #ifdef RTX5090_OPT
-    if ((random_blocks.workers_given || random_blocks.worker_id_given) && !random_blocks.enabled) {
+    if (!found_file.empty()) std::cout << "Found file : " << found_file << "\n";
+    random_blocks.found_file = found_file;
+    if ((random_blocks.workers_given || random_blocks.worker_id_given)
+        && !random_blocks.enabled && !random_blocks.child) {
         std::cerr << "Error: --workers and --worker-id require --random-blocks.\n";
         return EXIT_FAILURE;
     }
-    if (random_blocks.enabled && random_blocks.worker_id >= random_blocks.workers) {
+    if ((random_blocks.enabled || random_blocks.child) && random_blocks.worker_id >= random_blocks.workers) {
         std::cerr << "Error: --worker-id must be less than --workers.\n";
+        return EXIT_FAILURE;
+    }
+    if (random_blocks.permutation_counter_given != random_blocks.permutation_index_given) {
+        std::cerr << "Error: permutation metadata must include both counter and index.\n";
+        return EXIT_FAILURE;
+    }
+    if ((random_blocks.permutation_counter_given || random_blocks.permutation_index_given)
+        && !random_blocks.child) {
+        std::cerr << "Error: permutation metadata requires --random-child.\n";
         return EXIT_FAILURE;
     }
     if (self_test_count) return run_hash_self_test_5090(self_test_count);
@@ -1081,7 +1309,7 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << argv[0]
                   << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]";
 #ifdef RTX5090_OPT
-        std::cerr << " [--random-blocks [--seed S] [--checkpoint FILE] [--block-bits B] [--workers N --worker-id I]]";
+        std::cerr << " [--found-file PATH] [--random-blocks [--seed S] [--checkpoint FILE] [--block-bits B] [--workers N --worker-id I]]";
 #endif
         std::cerr << "\n";
         return EXIT_FAILURE;
@@ -1576,11 +1804,42 @@ int main(int argc, char** argv) {
     if (h_found_flag == FOUND_READY) {
         FoundResult host_result{};
         ck(cudaMemcpy(&host_result, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost), "read found_result");
+        const std::string private_key = formatHex256(host_result.scalar);
+        const std::string public_key = formatCompressedPubHex(host_result.Rx, host_result.Ry);
         std::cout << "\n======== FOUND MATCH! =================================\n";
-        std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
-        std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
+        std::cout << "Private Key   : " << private_key << "\n";
+        std::cout << "Public Key    : " << public_key << "\n";
 #ifdef RTX5090_OPT
-        if (random_blocks.child) exit_code = 10;
+        if (!found_file.empty()) {
+            FoundFileRecord record;
+            record.block_start = formatHex256(range_start);
+            record.block_end = formatHex256(range_end);
+            record.private_key = private_key;
+            record.public_key_compressed = public_key;
+            record.hash160 = format_hash160_5090(target_hash160);
+            record.address = address_b58;
+            record.workers = random_blocks.workers;
+            record.worker_id = random_blocks.worker_id;
+            record.has_permutation = random_blocks.permutation_counter_given
+                                  && random_blocks.permutation_index_given;
+            record.permutation_counter = random_blocks.permutation_counter;
+            record.permutation_index = random_blocks.permutation_index;
+            const FoundFileWriteStatus write_status = write_found_file_atomic_5090(found_file, record);
+            if (write_status == FoundFileWriteStatus::Written) {
+                exit_code = FOUND_FILE_EXIT_CODE;
+            } else if (write_status == FoundFileWriteStatus::AlreadyExists) {
+                std::cout << "Found file already exists; another worker has recorded a solution.\n";
+                exit_code = FOUND_FILE_EXIT_CODE;
+            } else {
+                std::cerr << "Error: cannot write found file " << found_file
+                          << ": " << std::strerror(errno) << "\n";
+                exit_code = EXIT_FAILURE;
+            }
+            std::cout.flush();
+            std::cerr.flush();
+        } else if (random_blocks.child) {
+            exit_code = 10;
+        }
 #endif
     } else {
         if (g_sigint) {
@@ -1602,5 +1861,7 @@ int main(int argc, char** argv) {
     if (h_start_scalars) cudaFreeHost(h_start_scalars);
     if (h_counts256)     cudaFreeHost(h_counts256);
 
+    std::cout.flush();
+    std::cerr.flush();
     return exit_code;
 }
